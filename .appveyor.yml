@@ -39,8 +39,8 @@ install:
   # Check out submodules
   - git submodule update --init --recursive
   # Install redistributable Kafka package
-  - ps: Install-Package librdkafka.redist -Version 1.0.0 || true
-  - ps: dotnet add package librdkafka.redist --version 1.0.0 || true
+  - ps: Install-Package librdkafka.redist -Version 1.0.0
+  - ps: dotnet add package librdkafka.redist --version 1.0.0
 
 build_script:
   - cargo build --all --locked -vv
