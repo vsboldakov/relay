@@ -625,12 +625,14 @@ impl CheckEnvelope {
 pub struct CheckedEnvelope {
     pub envelope: Option<Envelope>,
     pub rate_limits: RateLimits,
+    // pub scoping: Scoping,
 }
 
 /// Scoping information along with a checked envelope.
 #[derive(Debug)]
 pub struct CheckEnvelopeResponse {
     pub result: Result<CheckedEnvelope, DiscardReason>,
+    // TODO: Remove this
     pub scoping: Scoping,
 }
 

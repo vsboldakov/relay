@@ -134,7 +134,6 @@ impl ServiceState {
         let event_manager = EventManager::create(
             config.clone(),
             upstream_relay.clone(),
-            outcome_producer.clone(),
             redis_pool.clone(),
         )
         .context(ServerErrorKind::ConfigError)?

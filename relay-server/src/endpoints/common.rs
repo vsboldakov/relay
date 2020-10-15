@@ -1,8 +1,5 @@
 //! Common facilities for ingesting events through store-like endpoints.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use actix::prelude::*;
 use actix_web::http::{header, StatusCode};
 use actix_web::middleware::cors::{Cors, CorsBuilder};
@@ -16,9 +13,10 @@ use serde::Deserialize;
 use relay_common::{clone, metric, tryf, LogError};
 use relay_general::protocol::{EventId, EventType};
 use relay_quotas::RateLimits;
+use relay_config::Config;
 
 use crate::actors::events::{QueueEnvelope, QueueEnvelopeError};
-use crate::actors::outcome::{DiscardReason, Outcome, TrackOutcome};
+use crate::actors::outcome::{DiscardReason, Outcome};
 use crate::actors::project::CheckEnvelope;
 use crate::actors::project_cache::{GetProject, ProjectError};
 use crate::body::StorePayloadError;
@@ -26,8 +24,7 @@ use crate::envelope::{AttachmentType, Envelope, EnvelopeError, ItemType, Items};
 use crate::extractors::RequestMeta;
 use crate::metrics::RelayCounters;
 use crate::service::{ServiceApp, ServiceState};
-use crate::utils::{self, ApiErrorResponse, FormDataIter, MultipartError};
-use relay_config::Config;
+use crate::utils::{self, ApiErrorResponse, FormDataIter, MultipartError, OutcomeHandler};
 
 #[derive(Fail, Debug)]
 pub enum BadStoreRequest {
@@ -364,7 +361,6 @@ fn check_envelope_size_limits(config: &Config, envelope: &Envelope) -> bool {
 /// it will try to create a store_body from the request.
 pub fn handle_store_like_request<F, R, I>(
     meta: RequestMeta,
-    is_event: bool,
     request: HttpRequest<ServiceState>,
     extract_envelope: F,
     create_response: R,
@@ -401,53 +397,52 @@ where
     let event_manager = request.state().event_manager();
     let project_manager = request.state().project_cache();
     let outcome_producer = request.state().outcome_producer();
-    let remote_addr = meta.client_addr();
 
-    let scoping = Rc::new(RefCell::new(meta.get_partial_scoping()));
-    let event_id = Rc::new(RefCell::new(None));
+    let outcome_handler = OutcomeHandler::new(outcome_producer, &meta);
     let config = request.state().config();
 
     let future = project_manager
         .send(GetProject { id: project_id })
         .map_err(BadStoreRequest::ScheduleFailed)
-        .and_then(clone!(event_id, scoping, |project| {
+        .and_then(clone!(outcome_handler, |project| {
             extract_envelope(&request, meta)
                 .into_future()
-                .and_then(clone!(project, |envelope| {
-                    event_id.replace(envelope.event_id());
+                .and_then(clone!(project, outcome_handler, |envelope| {
+                    outcome_handler.update(&envelope);
 
                     project
                         .send(CheckEnvelope::cached(envelope))
                         .map_err(BadStoreRequest::ScheduleFailed)
                         .and_then(|result| result.map_err(BadStoreRequest::ProjectFailed))
                 }))
-                .and_then(clone!(scoping, |response| {
-                    scoping.replace(response.scoping);
-
-                    let checked = response.result.map_err(BadStoreRequest::EventRejected)?;
-
-                    // Skip over queuing and issue a rate limit right away
-                    let envelope = match checked.envelope {
-                        Some(envelope) => envelope,
-                        None => return Err(BadStoreRequest::RateLimited(checked.rate_limits)),
-                    };
-
+                .and_then(|response| response.result.map_err(BadStoreRequest::EventRejected))
+                // TODO: We need to return rate limits, because otherwise there's no way we can ever
+                // return them if someone spams us with too large requests.
+                .and_then(move |envelope| {
                     if check_envelope_size_limits(&config, &envelope) {
-                        Ok((envelope, checked.rate_limits))
+                        Ok(envelope)
                     } else {
                         Err(BadStoreRequest::PayloadError(StorePayloadError::Overflow))
                     }
-                }))
+                })
                 .and_then(move |(envelope, rate_limits)| {
-                    event_manager
+                    if envelope.is_empty() {
+                        // TODO: This is veeeery suboptimal.
+                        return Box::new(envelope.event_id(), rate_limits);
+                    }
+
+                    let future = event_manager
                         .send(QueueEnvelope {
                             envelope,
                             project,
                             start_time,
+                            outcome_handler,
                         })
                         .map_err(BadStoreRequest::ScheduleFailed)
                         .and_then(|result| result.map_err(BadStoreRequest::QueueFailed))
                         .map(move |event_id| (event_id, rate_limits))
+
+                    Box::new(future)
                 })
                 .and_then(move |(event_id, rate_limits)| {
                     if rate_limits.is_limited() {
@@ -458,20 +453,12 @@ where
                 })
         }))
         .or_else(move |error: BadStoreRequest| {
-            metric!(counter(RelayCounters::EnvelopeRejected) += 1);
-
-            if is_event {
-                outcome_producer.do_send(TrackOutcome {
-                    timestamp: start_time,
-                    scoping: scoping.borrow().clone(),
-                    outcome: error.to_outcome(),
-                    event_id: *event_id.borrow(),
-                    remote_addr,
-                });
-            }
+            outcome_handler.reject(error.to_outcome());
 
             if !emit_rate_limit && matches!(error, BadStoreRequest::RateLimited(_)) {
-                return Ok(create_response(*event_id.borrow()));
+                // return Ok(create_response(*event_id.borrow()));
+                // return Ok(create_response(outcome_handler.event_id()));
+                todo!();
             }
 
             let response = error.error_response();

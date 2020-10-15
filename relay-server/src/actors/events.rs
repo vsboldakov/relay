@@ -1,6 +1,4 @@
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,16 +22,16 @@ use relay_general::types::{Annotated, Array, Object, ProcessingAction, Value};
 use relay_quotas::RateLimits;
 use relay_redis::RedisPool;
 
-use crate::actors::outcome::{DiscardReason, Outcome, OutcomeProducer, TrackOutcome};
+use crate::actors::outcome::{DiscardReason, Outcome};
 use crate::actors::project::{
     CheckEnvelope, GetProjectState, Project, ProjectState, UpdateRateLimits,
 };
 use crate::actors::project_cache::ProjectError;
 use crate::actors::upstream::{SendRequest, UpstreamRelay, UpstreamRequestError};
 use crate::envelope::{self, AttachmentType, ContentType, Envelope, Item, ItemType};
-use crate::metrics::{RelayCounters, RelayHistograms, RelaySets, RelayTimers};
+use crate::metrics::{RelayHistograms, RelaySets, RelayTimers};
 use crate::service::ServerError;
-use crate::utils::{self, FormDataIter, FutureExt};
+use crate::utils::{self, FormDataIter, FutureExt, OutcomeHandler};
 
 #[cfg(feature = "processing")]
 use {
@@ -1078,7 +1076,6 @@ pub struct EventManager {
     upstream: Addr<UpstreamRelay>,
     processor: Addr<EventProcessor>,
     current_active_events: u32,
-    outcome_producer: Addr<OutcomeProducer>,
     captured_events: Arc<RwLock<BTreeMap<EventId, CapturedEvent>>>,
 
     #[cfg(feature = "processing")]
@@ -1089,7 +1086,6 @@ impl EventManager {
     pub fn create(
         config: Arc<Config>,
         upstream: Addr<UpstreamRelay>,
-        outcome_producer: Addr<OutcomeProducer>,
         redis_pool: Option<RedisPool>,
     ) -> Result<Self, ServerError> {
         let thread_count = config.cpu_concurrency();
@@ -1143,8 +1139,6 @@ impl EventManager {
 
             #[cfg(feature = "processing")]
             store_forwarder,
-
-            outcome_producer,
         })
     }
 }
@@ -1169,6 +1163,7 @@ pub struct QueueEnvelope {
     pub envelope: Envelope,
     pub project: Addr<Project>,
     pub start_time: Instant,
+    pub outcome_handler: OutcomeHandler,
 }
 
 impl Message for QueueEnvelope {
@@ -1202,11 +1197,16 @@ impl Handler<QueueEnvelope> for EventManager {
         //  2. Event envelope processing can bail out if the event is filtered or rate limited,
         //     since all items depend on this event.
         if let Some(event_envelope) = message.envelope.split_by(Item::requires_event) {
+            let outcome_handler = message.outcome_handler.split();
+            message.outcome_handler.update(&message.envelope);
+            outcome_handler.update(&event_envelope);
+
             self.current_active_events += 1;
             context.notify(HandleEnvelope {
                 envelope: event_envelope,
                 project: message.project.clone(),
                 start_time: message.start_time,
+                outcome_handler,
             });
         }
 
@@ -1215,6 +1215,7 @@ impl Handler<QueueEnvelope> for EventManager {
             envelope: message.envelope,
             project: message.project,
             start_time: message.start_time,
+            outcome_handler: message.outcome_handler,
         });
 
         // Actual event handling is performed asynchronously in a separate future. The lifetime of
@@ -1230,6 +1231,7 @@ struct HandleEnvelope {
     pub envelope: Envelope,
     pub project: Addr<Project>,
     pub start_time: Instant,
+    pub outcome_handler: OutcomeHandler,
 }
 
 impl Message for HandleEnvelope {
@@ -1258,7 +1260,6 @@ impl Handler<HandleEnvelope> for EventManager {
 
         let upstream = self.upstream.clone();
         let processor = self.processor.clone();
-        let outcome_producer = self.outcome_producer.clone();
         let captured_events = self.captured_events.clone();
         let capture = self.config.relay_mode() == RelayMode::Capture;
 
@@ -1269,18 +1270,14 @@ impl Handler<HandleEnvelope> for EventManager {
             envelope,
             project,
             start_time,
+            outcome_handler,
         } = message;
 
         let event_id = envelope.event_id();
         let project_id = envelope.meta().project_id();
-        let remote_addr = envelope.meta().client_addr();
 
-        // Compute whether this envelope contains an event. This is used in error handling to
-        // appropriately emit an outecome. Envelopes not containing events (such as standalone
-        // attachment uploads or user reports) should never create outcomes.
-        let is_event = envelope.items().any(Item::creates_event);
-
-        let scoping = Rc::new(RefCell::new(envelope.meta().get_partial_scoping()));
+        // TODO(ja): FIX THIS
+        // let scoping: std::rc::Rc<std::cell::RefCell<relay_quotas::Scoping>> = todo!("pass through");
 
         metric!(set(RelaySets::UniqueProjects) = project_id.value() as i64);
 
@@ -1288,23 +1285,21 @@ impl Handler<HandleEnvelope> for EventManager {
             .send(CheckEnvelope::fetched(envelope))
             .map_err(ProcessingError::ScheduleFailed)
             .and_then(|result| result.map_err(ProcessingError::ProjectFailed))
-            .and_then(clone!(scoping, |response| {
-                scoping.replace(response.scoping);
-
+            .and_then(move |response| {
                 let checked = response.result.map_err(ProcessingError::EventRejected)?;
                 match checked.envelope {
-                    Some(envelope) => Ok(envelope),
+                    Some(envelope) => Ok((envelope, response.scoping)),
                     None => Err(ProcessingError::RateLimited(checked.rate_limits)),
                 }
-            }))
-            .and_then(clone!(project, |envelope| {
+            })
+            .and_then(clone!(project, |(envelope, scoping)| {
                 project
                     .send(GetProjectState)
                     .map_err(ProcessingError::ScheduleFailed)
                     .and_then(|result| result.map_err(ProcessingError::ProjectFailed))
-                    .map(|state| (envelope, state))
+                    .map(|state| (envelope, scoping, state))
             }))
-            .and_then(move |(envelope, project_state)| {
+            .and_then(move |(envelope, scoping, project_state)| {
                 processor
                     .send(ProcessEnvelope {
                         envelope,
@@ -1313,8 +1308,9 @@ impl Handler<HandleEnvelope> for EventManager {
                     })
                     .map_err(ProcessingError::ScheduleFailed)
                     .flatten()
+                    .map(|processed| (processed, scoping))
             })
-            .and_then(clone!(project, |processed| {
+            .and_then(clone!(project, |(processed, scoping)| {
                 let rate_limits = processed.rate_limits;
 
                 // Processing returned new rate limits. Cache them on the project to avoid expensive
@@ -1324,11 +1320,11 @@ impl Handler<HandleEnvelope> for EventManager {
                 }
 
                 match processed.envelope {
-                    Some(envelope) => Ok(envelope),
+                    Some(envelope) => Ok((envelope, scoping)),
                     None => Err(ProcessingError::RateLimited(rate_limits)),
                 }
             }))
-            .and_then(clone!(captured_events, scoping, |mut envelope| {
+            .and_then(clone!(captured_events, |(mut envelope, scoping)| {
                 #[cfg(feature = "processing")]
                 {
                     if let Some(store_forwarder) = store_forwarder {
@@ -1337,7 +1333,7 @@ impl Handler<HandleEnvelope> for EventManager {
                             .send(StoreEnvelope {
                                 envelope,
                                 start_time,
-                                scoping: scoping.borrow().clone(),
+                                scoping,
                             })
                             .map_err(ProcessingError::ScheduleFailed)
                             .and_then(move |result| result.map_err(ProcessingError::StoreFailed));
@@ -1351,7 +1347,7 @@ impl Handler<HandleEnvelope> for EventManager {
                 if capture {
                     // XXX: this is wrong because captured_events does not take envelopes without
                     // event_id into account.
-                    if let Some(event_id) = event_id {
+                    if let Some(event_id) = envelope.event_id() {
                         log::debug!("capturing envelope");
                         captured_events
                             .write()
@@ -1396,7 +1392,7 @@ impl Handler<HandleEnvelope> for EventManager {
                     .and_then(move |result| {
                         result.map_err(move |error| match error {
                             UpstreamRequestError::RateLimited(upstream_limits) => {
-                                let limits = upstream_limits.scope(&scoping.borrow());
+                                let limits = upstream_limits.scope(&scoping);
                                 project.do_send(UpdateRateLimits(limits.clone()));
                                 ProcessingError::RateLimited(limits)
                             }
@@ -1408,10 +1404,8 @@ impl Handler<HandleEnvelope> for EventManager {
             }))
             .into_actor(self)
             .timeout(self.config.event_buffer_expiry(), ProcessingError::Timeout)
-            .map(|_, _, _| metric!(counter(RelayCounters::EnvelopeAccepted) += 1))
+            .map(clone!(outcome_handler, |_, _, _| outcome_handler.accept()))
             .map_err(move |error, slf, _| {
-                metric!(counter(RelayCounters::EnvelopeRejected) += 1);
-
                 // if we are in capture mode, we stash away the event instead of
                 // forwarding it.
                 if capture {
@@ -1427,12 +1421,6 @@ impl Handler<HandleEnvelope> for EventManager {
                     }
                 }
 
-                // Do not track outcomes or capture events for non-event envelopes (such as
-                // individual attachments)
-                if !is_event {
-                    return;
-                }
-
                 let outcome = error.to_outcome();
                 if let Some(Outcome::Invalid(DiscardReason::Internal)) = outcome {
                     // Errors are only logged for what we consider an internal discard reason. These
@@ -1444,13 +1432,9 @@ impl Handler<HandleEnvelope> for EventManager {
                 }
 
                 if let Some(outcome) = outcome {
-                    outcome_producer.do_send(TrackOutcome {
-                        timestamp: Instant::now(),
-                        scoping: scoping.borrow().clone(),
-                        outcome,
-                        event_id,
-                        remote_addr,
-                    })
+                    // TODO: In which cases is this None?
+                    // Can we move logging into OutcomeHandler?
+                    outcome_handler.reject(outcome);
                 }
             })
             .then(move |x, slf, _| {
