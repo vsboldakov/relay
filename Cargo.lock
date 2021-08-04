@@ -3371,6 +3371,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "relay-thin"
+version = "0.1.0"
+dependencies = [
+ "failure",
+ "relay-auth",
+ "relay-config",
+ "relay-log",
+ "relay-server",
+]
+
+[[package]]
 name = "remove_dir_all"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
