@@ -25,6 +25,12 @@ To the changelog entry, please add a link to this PR (consider a more descriptiv
 - ${getCleanTitle()}. (${PR_LINK})
 \`\`\`
 
+The new entry should be under the _Unreleased_ version section. If there isn't one at the time of the PR, create it:
+
+\`\`\`md
+## Unreleased
+\`\`\`
+
 If none of the above apply, you can opt out by adding _#skip-changelog_ to the PR description.
 
 </details>
