@@ -693,6 +693,8 @@ pub struct Bucket {
     /// See [`Metric::tags`]. Every combination of tags results in a different bucket.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
+    /// The project to which the bucket belongs
+    pub project_key: ProjectKey,
 }
 
 impl Bucket {
@@ -703,6 +705,7 @@ impl Bucket {
             unit: key.metric_unit,
             value,
             tags: key.tags,
+            project_key: key.project_key,
         }
     }
 
@@ -736,6 +739,7 @@ impl Error for AggregateMetricsError {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct BucketKey {
+    project_key: ProjectKey,
     timestamp: UnixTimestamp,
     metric_name: String,
     metric_type: MetricType,
@@ -1009,8 +1013,13 @@ impl Aggregator {
     /// Inserts a metric into the corresponding bucket in this aggregator.
     ///
     /// If no bucket exists for the given bucket key, a new bucket will be created.
-    pub fn insert(&mut self, metric: Metric) -> Result<(), AggregateMetricsError> {
+    pub fn insert(
+        &mut self,
+        metric: Metric,
+        project_key: ProjectKey,
+    ) -> Result<(), AggregateMetricsError> {
         let key = BucketKey {
+            project_key,
             timestamp: self.get_bucket_timestamp(metric.timestamp),
             metric_name: metric.name,
             metric_type: metric.value.ty(),
@@ -1025,6 +1034,7 @@ impl Aggregator {
     /// If no bucket exists for the given bucket key, a new bucket will be created.
     pub fn merge(&mut self, bucket: Bucket) -> Result<(), AggregateMetricsError> {
         let key = BucketKey {
+            project_key: bucket.project_key,
             timestamp: bucket.timestamp,
             metric_name: bucket.name,
             metric_type: bucket.value.ty(),
@@ -1113,16 +1123,18 @@ impl Actor for Aggregator {
 /// A message containing a list of [`Metric`]s to be inserted into the aggregator.
 #[derive(Debug)]
 pub struct InsertMetrics {
+    project_key: ProjectKey,
     metrics: Vec<Metric>,
 }
 
 impl InsertMetrics {
     /// Creates a new message containing a list of [`Metric`]s.
-    pub fn new<I>(metrics: I) -> Self
+    pub fn new<I>(project_key: ProjectKey, metrics: I) -> Self
     where
         I: IntoIterator<Item = Metric>,
     {
         Self {
+            project_key,
             metrics: metrics.into_iter().collect(),
         }
     }
@@ -1137,7 +1149,7 @@ impl Handler<InsertMetrics> for Aggregator {
 
     fn handle(&mut self, msg: InsertMetrics, _ctx: &mut Self::Context) -> Self::Result {
         for metric in msg.metrics {
-            self.insert(metric)?;
+            self.insert(metric, msg.project_key)?;
         }
 
         Ok(())

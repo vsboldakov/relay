@@ -550,7 +550,7 @@ impl Project {
 
     pub fn insert_metrics(&mut self, metrics: Vec<Metric>) {
         if let Some(aggregator) = self.get_or_create_aggregator() {
-            aggregator.do_send(relay_metrics::InsertMetrics::new(metrics));
+            aggregator.do_send(relay_metrics::InsertMetrics::new(self.project_key, metrics));
         }
     }
 
