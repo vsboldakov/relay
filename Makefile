@@ -24,7 +24,7 @@ release: setup-git
 .PHONY: release
 
 build-linux-release: setup-git
-	cd relay && cargo build --release --locked --features ${RELAY_FEATURES} --target=${TARGET}
+	cd relay && cargo build --release --features ${RELAY_FEATURES} --target=${TARGET}
 	objcopy --only-keep-debug target/${TARGET}/release/relay{,.debug}
 	objcopy --strip-debug --strip-unneeded target/${TARGET}/release/relay
 	objcopy --add-gnu-debuglink target/${TARGET}/release/relay{.debug,}

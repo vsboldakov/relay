@@ -29,8 +29,9 @@ WORKDIR /work
 FROM getsentry/sentry-cli:1 AS sentry-cli
 FROM relay-deps AS relay-builder
 
-ARG RELAY_FEATURES=ssl,processing
+ARG RELAY_FEATURES=ssl,kafka-ssl,processing
 ENV RELAY_FEATURES=${RELAY_FEATURES}
+ENV OPENSSL_ROOT_DIR=/usr/local/build/$BUILD_TARGET
 
 COPY --from=sentry-cli /bin/sentry-cli /bin/sentry-cli
 COPY . .
